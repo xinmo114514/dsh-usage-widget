@@ -189,6 +189,20 @@ CI=true pnpm install --no-frozen-lockfile   # 更新锁文件并链接新包
 
 > 提示：`dsh plugin --profile web add <路径>` 可代替第 2 步的 `link:` 手动编辑（它会把包 pnpm-install 进 profile）。
 
+### 6.3 在"插件管理"中查看
+
+本插件作为 Loader 组合条目，会出现在 **设置 → 插件 → 插件清单** 里：
+
+- 条目：`usage-widget`（模块 `dsh-usage-widget`），状态圆点为绿色（active）
+- 该清单由 `dsh-host-plugin-inventory` 从 Loader 条目实时投影，安装后无需额外配置
+
+### 6.4 插件注册表通道（可选）
+
+仓库同时提供 `dsh.plugin.json` 注册表清单与注册表通道客户端 bundle（`lib/client-registry.js`，注册 id 为 `dsh-external/dsh-usage-widget`）：
+
+- 需要 DSH 集成 [plugin-registry](https://github.com/dsh-external/plugin-registry)（提供 `dsh registry` 命令）后才能 `dsh registry install ./registry && dsh registry enable dsh-external/dsh-usage-widget`；
+- ⚠️ 同时启用 profile 通道与注册表通道会**双挂载**（宿主半加载两次、页面出现两个悬浮窗）——二选一。
+
 ## 7. 构建与开发
 
 ### 7.1 目录结构
@@ -196,7 +210,8 @@ CI=true pnpm install --no-frozen-lockfile   # 更新锁文件并链接新包
 ```
 dsh-usage-widget/
 ├── package.json          # dsh.client 声明 + exports（. → 宿主，./client → 客户端 bundle）
-├── tsdown.config.ts      # 双产物构建：node ESM 宿主 + 浏览器 CJS 客户端 bundle
+├── dsh.plugin.json       # 插件注册表清单（id: dsh-external/dsh-usage-widget，注册表通道用）
+├── tsdown.config.ts      # 三产物构建：node ESM 宿主 + profile 通道客户端 + 注册表通道客户端
 ├── src/
 │   ├── index.ts          # 宿主半：聚合扫描 + /usage/api 路由（纯 Node 内置模块）
 │   └── client/
@@ -207,7 +222,7 @@ dsh-usage-widget/
 ### 7.2 构建命令
 
 ```bash
-pnpm build    # tsdown：lib/index.js + lib/client.js
+pnpm build    # tsdown：lib/index.js + lib/client.js + lib/client-registry.js
 pnpm watch    # 开发时增量构建
 ```
 
