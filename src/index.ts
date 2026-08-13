@@ -2,20 +2,24 @@
  * Host half of dsh-usage-widget.
  *
  * Responsibilities:
- *   1) After mount, asynchronously scan all session logs and fold token
+ *   1) After mount, asynchronously scan ALL session logs and fold token
  *      usage (per session + per local day).
- *   2) Multi-source scan: sessionQuery (listSessions + readSession) first;
- *      fall back to sessionPersistence (list + readFrom(id, 0)).
- *   3) RAW recovery: when both interpreters refuse a session log (e.g. the
- *      log was written by a newer harness and contains unknown event types),
- *      decompress the session's own session.jsonl.zstd (multi-frame zstd via
- *      the `zstd` CLI) and fold only the assistant/message usage events —
- *      this recovers usage the harness refuses to surface.
+ *   2) RAW-first scan: walk ~/.dsh/sessions, decompress every
+ *      session.jsonl.zstd (multi-frame zstd via the `zstd` CLI; Node's zlib
+ *      only surfaces the first frame) and fold assistant/message usage
+ *      directly — immune to the harness interpreter's unknown-event refusals
+ *      (a newer harness may write event types this build does not know) and
+ *      verified byte-exact against an independent log audit.
+ *   3) Harness fallback: when RAW decode fails (e.g. a still-writing trailing
+ *      frame), fall back to sessionQuery.readSession / readFrom(id, 0).
  *   4) ctx.on('session/event') live incremental fold with a per-session
- *      maxSeq watermark for dedupe.
- *   5) Periodic self-healing re-scan every 60s (watermark keeps it idempotent).
+ *      maxSeq watermark for dedupe (all assistant/message events carry seq).
+ *   5) Periodic self-healing re-scan every 60s, guarded by a reentrancy lock
+ *      so scans never overlap (watermark keeps re-folds idempotent).
  *   6) POST /usage/api/snapshot — JSON API for the client half. Request:
  *      { sessionId?: string | null }; response { ok: true, value: <snapshot> }.
+ *      The route is read-only aggregate stats, fenced to loopback Hosts
+ *      (DNS-rebinding / cross-site defense), like the DSH sidebar routes.
  *
  * Data source: assistant/message events whose data.usage.inputTokens is a
  * number. total = input + output + cacheRead + cacheWrite (no reasoning).
@@ -25,7 +29,7 @@
  */
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import { execFile } from 'node:child_process'
-import { existsSync, readdirSync, statSync } from 'node:fs'
+import { readdirSync, statSync } from 'node:fs'
 import { join } from 'node:path'
 
 export const name = 'dsh-usage-widget'
@@ -157,6 +161,29 @@ function writeError(res: ServerResponse, error: unknown): void {
   writeJson(res, 500, { ok: false, error: { code: 'internal', message } })
 }
 
+/** DNS-rebinding / cross-site defense for the JSON API: only loopback
+ *  authorities may call it (the DSH web server binds 127.0.0.1). */
+function isLoopbackHost(hostHeader: string | undefined): boolean {
+  if (!hostHeader) return false
+  let hostname = hostHeader
+  const at = hostHeader.lastIndexOf('@')
+  if (at !== -1) hostname = hostHeader.slice(at + 1)
+  if (hostname.startsWith('[')) {
+    // [::1]:port or [::1]
+    const end = hostname.indexOf(']')
+    return end !== -1 && hostname.slice(1, end) === '::1'
+  }
+  if (hostname === '::1') return true
+  const colon = hostname.lastIndexOf(':')
+  if (colon !== -1 && hostname.indexOf(']') === -1 && hostname.indexOf(':') === colon) {
+    hostname = hostname.slice(0, colon)
+  }
+  if (hostname === 'localhost') return true
+  const parts = hostname.split('.')
+  return parts.length === 4 && parts[0] === '127' &&
+    parts.every((part) => /^\d{1,3}$/.test(part) && Number(part) <= 255)
+}
+
 export function apply(ctx: any): void {
   // ---- 双通道自动去重（profile 通道 / 注册表通道）----
   // 两个通道可能同时挂载（各有一份 lib/index.js，但共享同一进程的
@@ -176,6 +203,7 @@ export function apply(ctx: any): void {
     allAgg: newAgg(),
     allDaily: new Map<number, ReturnType<typeof newAgg>>(),
     scanning: false,
+    running: false,               // 扫描防重入锁
     scans: 0,
     failed: 0,                    // 本轮 RAW 与 harness 均无法读取的会话数
     rawSessions: 0,               // 通过 RAW 日志（zstd 直接解析）折叠的会话数
@@ -225,6 +253,9 @@ export function apply(ctx: any): void {
   async function scanOnce(options: { initial?: boolean }): Promise<void> {
     const initial = !!(options && options.initial)
     if (initial) store.scanning = true
+    // 防重入：扫描不重叠（初始扫描与 60s 自愈重扫互斥）
+    if (store.running) return
+    store.running = true
     store.scans += 1
     store.lastScanAt = Date.now()
     // 每轮扫描独立计数；全部成功则清除历史错误（自愈）
@@ -281,25 +312,22 @@ export function apply(ctx: any): void {
         while (i < idList.length) {
           const id = idList[i]; i += 1
           try {
-            let events: any[] | null = null
-            // 2a) RAW path: decompress the session's own log
+            // 2a) RAW path: decompress the session's own log. 解码成功即视为
+            //     可读（即使 0 条可用事件——那只是"没有用量"的会话，不是失败）。
             const rawPath = logPaths.get(id)
             if (rawPath) {
               try {
                 const text = await zstdToText(rawPath)
-                events = parseLogLines(text)
-                if (events && events.length) {
-                  foldSessionEvents(id, events)
-                  store.rawSessions += 1
-                  continue
-                }
-                events = null
+                const parsed = parseLogLines(text)
+                foldSessionEvents(id, parsed)
+                store.rawSessions += 1
+                continue
               } catch (e) {
                 store.lastError = 'raw ' + shortOf(id) + ': ' + msgOf(e)
-                events = null
               }
             }
             // 2b) harness fallback: sessionQuery.readSession / persistence.readFrom
+            let events: any[] | null = null
             if (query) {
               try {
                 const snap = await query.readSession(id)
@@ -315,13 +343,14 @@ export function apply(ctx: any): void {
                 events = r && Array.isArray(r.events) ? r.events : []
               } catch (e) {
                 store.lastError = 'readFrom ' + shortOf(id) + ': ' + msgOf(e)
-                events = []
+                events = null
               }
             }
             if (events && events.length) {
               foldSessionEvents(id, events)
               store.harnessSessions += 1
-            } else {
+            } else if (events === null) {
+              // RAW 失败 且 harness 也报错 → 才算失败；空会话（events=[]）不算
               store.failed += 1
             }
           } catch (e) {
@@ -339,6 +368,7 @@ export function apply(ctx: any): void {
       // 本轮无失败会话 → 清除历史标记（自愈：日志可读性恢复后自动消失）
       if (store.failed === 0) { store.lastError = null; store.scanError = null }
       if (initial) store.scanning = false
+      store.running = false
     }
   }
 
@@ -433,6 +463,11 @@ export function apply(ctx: any): void {
       kind: 'prefix',
       path: '/usage/api',
       handler: async (req: IncomingMessage, res: ServerResponse) => {
+        // 信任围栏：仅回环 Host 可访问（防 DNS 重绑定 / 跨站探测）
+        if (!isLoopbackHost(req.headers.host)) {
+          writeJson(res, 403, { ok: false, error: { code: 'forbidden', message: 'forbidden' } })
+          return
+        }
         const pathname = new URL(req.url ?? '/', 'http://dsh.internal').pathname
         const method = pathname.startsWith('/usage/api/')
           ? pathname.slice('/usage/api/'.length)

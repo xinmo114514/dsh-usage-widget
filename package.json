@@ -17,7 +17,8 @@
   "files": [
     "lib",
     "src",
-    "README.md"
+    "README.md",
+    "dsh.plugin.json"
   ],
   "engines": {
     "node": ">=20"

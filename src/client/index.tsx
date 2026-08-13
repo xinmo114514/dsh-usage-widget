@@ -129,15 +129,16 @@ const buildSet = (series: any[], range: string): any => {
     }
   }
 
-  let total = 0, input = 0, output = 0, cacheRead = 0, calls = 0
+  let total = 0, input = 0, output = 0, cacheRead = 0, cacheWrite = 0, calls = 0
   buckets.forEach((b) => {
     total += dayTotal(b)
     input += b.input || 0; output += b.output || 0
-    cacheRead += b.cacheRead || 0; calls += b.calls || 0
+    cacheRead += b.cacheRead || 0; cacheWrite += b.cacheWrite || 0; calls += b.calls || 0
   })
-  const hitDenom = input + cacheRead
+  // 命中率分母与 hitRateOf / 宿主契约一致：input + cacheRead + cacheWrite
+  const hitDenom = input + cacheRead + cacheWrite
   return {
-    buckets, total, input, output, cacheRead, calls,
+    buckets, total, input, output, cacheRead, cacheWrite, calls,
     hitRate: hitDenom > 0 ? Math.round((cacheRead / hitDenom) * 1000) / 10 : null,
   }
 }
@@ -539,8 +540,6 @@ function UsageWidget(props: { useSessions?: (selector: (s: any) => any) => any }
       ),
     )
   }
-
-  const title = err ? '数据不可用' : (!data || !data.ok) ? '加载中…' : ''
 
   return createElement('div', { className: 'uwx-root', 'data-dark': dk },
     createElement('div', {
