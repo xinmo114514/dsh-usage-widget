@@ -754,6 +754,18 @@ function UsageWidget(props: { useSessions?: (selector: (s: any) => any) => any }
 // Plugin entry
 // ============================================================
 export function apply(ctx: any): void {
+  // ---- 双通道自动去重（profile 通道 / 注册表通道）----
+  // 两个 bundle 可能同时被页面加载（client.js 与 client-registry.js 共享
+  // 同一 window）。先到者注册 UI，后到者自动待命；生效者卸载时让位，
+  // 下一次页面加载时由存活的通道接管。避免双窗口。
+  const g = (typeof window !== 'undefined' ? window : globalThis) as any
+  if (g.__dshUsageWidgetClientActive) {
+    console.log('[dsh-usage-widget] standby: another channel is active — client mount skipped')
+    return
+  }
+  g.__dshUsageWidgetClientActive = true
+  ctx.effect(() => () => { g.__dshUsageWidgetClientActive = false }, 'dsh-usage-widget: client dedup claim')
+
   // style injection owned by the plugin fiber
   ctx.effect(() => {
     if (typeof document === 'undefined') return

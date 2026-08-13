@@ -201,7 +201,7 @@ CI=true pnpm install --no-frozen-lockfile   # 更新锁文件并链接新包
 仓库同时提供 `dsh.plugin.json` 注册表清单与注册表通道客户端 bundle（`lib/client-registry.js`，注册 id 为 `dsh-external/dsh-usage-widget`）：
 
 - 需要 DSH 集成 [plugin-registry](https://github.com/dsh-external/plugin-registry)（提供 `dsh registry` 命令）后才能 `dsh registry install ./registry && dsh registry enable dsh-external/dsh-usage-widget`；
-- ⚠️ 同时启用 profile 通道与注册表通道会**双挂载**（宿主半加载两次、页面出现两个悬浮窗）——二选一。
+- **双通道可安全共存**：插件内置自动去重——宿主半用进程级 `globalThis` 标志、客户端半用页面级 `window` 标志，**先加载的通道生效，后加载的自动进入待命**（控制台打印 `standby: another channel is active`），生效通道卸载时让位，下次加载由存活的通道接管。因此 profile 通道与注册表通道同时启用**不会**出现两个悬浮窗或重复扫描。
 
 ## 7. 构建与开发
 

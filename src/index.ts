@@ -102,6 +102,18 @@ function writeError(res: ServerResponse, error: unknown): void {
 }
 
 export function apply(ctx: any): void {
+  // ---- 双通道自动去重（profile 通道 / 注册表通道）----
+  // 两个通道可能同时挂载（各有一份 lib/index.js，但共享同一进程的
+  // globalThis）。先到者生效，后到者自动待命；生效者卸载时让位，
+  // 下一次组合加载（重启/重启用）时由存活的通道接管。
+  const g = globalThis as any
+  if (g.__dshUsageWidgetHostActive) {
+    console.log('[dsh-usage-widget] standby: another channel is active — host mount skipped')
+    return
+  }
+  g.__dshUsageWidgetHostActive = true
+  ctx.effect(() => () => { g.__dshUsageWidgetHostActive = false }, 'dsh-usage-widget: host dedup claim')
+
   // ---- in-memory aggregate store ----
   const store = {
     sessions: new Map<string, any>(), // sessionId -> { daily: Map, allAgg, maxSeq }
