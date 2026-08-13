@@ -602,7 +602,7 @@ function UsageWidget(props: { useSessions?: (selector: (s: any) => any) => any }
               createElement('div', { className: 'uwx-cell-k' }, '缓存命中')),
           ),
           createElement('div', { className: 'uwx-card-foot' },
-            '调用 ' + fmtFull(set.calls) + ' 次 · 命中 ' + pctOf(set.hitRate)),
+            '调用 ' + fmtFull(set.calls) + ' 次 · 命中 ' + fmt(set.cacheRead)),
         ),
 
         createElement('div', { className: 'uwx-chips' },
