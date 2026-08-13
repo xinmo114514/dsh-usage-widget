@@ -124,12 +124,15 @@
 | 计入事件 | 仅 `assistant/message` 且 `data.usage.inputTokens` 为 number 的事件（会话标题等系统辅助 LLM 调用不计） |
 | 累加字段 | `input=usage.inputTokens`、`output=usage.outputTokens`、`cacheRead=usage.cacheReadTokens`、`cacheWrite=usage.cacheWriteTokens`、`reasoning=usage.reasoningTokens` |
 | **total 口径** | `total = input + output + cacheRead + cacheWrite`（**不含 reasoning**；reasoning 仅在会话卡与序列字段中单独体现） |
+| **RAW 优先扫描** | 首选直接解析每个会话自己的 `session.jsonl.zstd`（多帧 zstd，经 `zstd` CLI 解压），只提取 assistant/message 的 usage —— 不受 harness 解释器的未知事件拒读影响，覆盖 100% 会话（本机审计 32/32 会话可读，与独立逐条审计结果完全一致） |
+| **harness 兜底** | RAW 路径失败时（如日志正在写入的最后帧不完整）回退 `sessionQuery.readSession` / `sessionPersistence.readFrom` |
 | 按天分桶 | 该事件当天**本地时区 0 点**的 epoch ms（避免 UTC 偏差） |
-| 去重 | live 事件与扫描共用会话级 `maxSeq` 水位，`seq <= maxSeq` 跳过；水位单调递增保证不重不漏 |
+| 去重 | live 事件与扫描共用会话级 `maxSeq` 水位，`seq <= maxSeq` 跳过；水位单调递增保证不重不漏（`dedupSkipped` 审计字段可见） |
 | 初始扫描 | 插件挂载后立即异步全量扫描（并发 4），期间 `scanning=true`，返回部分已折叠数据 |
 | 自愈重扫 | 每 60s 增量重扫一次（水位去重，不会重复计数） |
-| 失败处理 | 单会话读取失败 → `failed+1` 并记录 `lastError`（UI 显示"缺 N 会话"徽标）；某轮扫描零失败 → 自动清除历史错误标记 |
-| 生命周期 | 聚合为进程内存态；`dsh web` 重启后重新全量扫描（历史数据仍在日志里，可完整恢复） |
+| 失败处理 | RAW 与 harness 均失败才计入 `failed`（UI 显示"缺 N 会话"徽标）；某轮扫描零失败 → 自动清除历史错误标记 |
+| 生命周期 | 聚合为进程内存态；`dsh web` 重启后重新全量扫描（历史日志完整，可完整恢复） |
+| **准确性验证** | 快照带审计字段：`foldedEvents`（已折叠事件数）、`dedupSkipped`（去重跳过数）、`rawSessions`/`harnessSessions`（各路径会话数）、`failed`；可与独立日志解析对账（本机实测逐字节一致） |
 
 ## 6. 安装（把它装进你的 DSH）
 

@@ -6,10 +6,15 @@
  *      usage (per session + per local day).
  *   2) Multi-source scan: sessionQuery (listSessions + readSession) first;
  *      fall back to sessionPersistence (list + readFrom(id, 0)).
- *   3) ctx.on('session/event') live incremental fold with a per-session
+ *   3) RAW recovery: when both interpreters refuse a session log (e.g. the
+ *      log was written by a newer harness and contains unknown event types),
+ *      decompress the session's own session.jsonl.zstd (multi-frame zstd via
+ *      the `zstd` CLI) and fold only the assistant/message usage events —
+ *      this recovers usage the harness refuses to surface.
+ *   4) ctx.on('session/event') live incremental fold with a per-session
  *      maxSeq watermark for dedupe.
- *   4) Periodic self-healing re-scan every 60s (watermark keeps it idempotent).
- *   5) POST /usage/api/snapshot — JSON API for the client half. Request:
+ *   5) Periodic self-healing re-scan every 60s (watermark keeps it idempotent).
+ *   6) POST /usage/api/snapshot — JSON API for the client half. Request:
  *      { sessionId?: string | null }; response { ok: true, value: <snapshot> }.
  *
  * Data source: assistant/message events whose data.usage.inputTokens is a
@@ -19,6 +24,9 @@
  * cordis inject list.
  */
 import type { IncomingMessage, ServerResponse } from 'node:http'
+import { execFile } from 'node:child_process'
+import { existsSync, readdirSync, statSync } from 'node:fs'
+import { join } from 'node:path'
 
 export const name = 'dsh-usage-widget'
 
@@ -36,6 +44,54 @@ function newAgg() {
 function localMidnight(timeMs: number): number {
   const d = new Date(timeMs)
   return new Date(d.getFullYear(), d.getMonth(), d.getDate()).getTime()
+}
+
+// ============================================================
+// Raw-log recovery helpers
+// ============================================================
+const DSH_HOME = process.env.DSH_HOME || join(process.env.HOME || '', '.dsh')
+const SESSIONS_ROOT = join(DSH_HOME, 'sessions')
+
+/** Decompress a session log. Session logs are CONCATENATED zstd frames (one
+ *  frame per append); Node's zlib only surfaces the first frame, so use the
+ *  `zstd` CLI which handles concatenated frames natively. */
+function zstdToText(filePath: string): Promise<string> {
+  return new Promise((resolve, reject) => {
+    execFile('zstd', ['-d', '-c', filePath], { maxBuffer: 128 * 1024 * 1024 }, (error, stdout) => {
+      if (error) reject(error)
+      else resolve(stdout)
+    })
+  })
+}
+
+/** Parse an NDJSON log body into events (malformed lines are skipped). */
+function parseLogLines(text: string): any[] {
+  const events: any[] = []
+  for (const line of text.split('\n')) {
+    const t = line.trim()
+    if (!t) continue
+    try { events.push(JSON.parse(t)) } catch { /* skip */ }
+  }
+  return events
+}
+
+/** Recursively discover every session log under the sessions root (depth ≤3):
+ *  map sessionId -> log path. Also locates bare-id and encoded-workspace dirs. */
+function findSessionLogs(root: string, depth: number, out: Map<string, string>): void {
+  if (depth > 3) return
+  let entries: string[]
+  try { entries = readdirSync(root) } catch { return }
+  for (const entry of entries) {
+    const p = join(root, entry)
+    let st: any
+    try { st = statSync(p) } catch { continue }
+    if (st.isDirectory()) {
+      findSessionLogs(p, depth + 1, out)
+    } else if (entry === 'session.jsonl.zstd') {
+      const id = root.split('/').pop() || ''
+      if (id) out.set(id, p)
+    }
+  }
 }
 
 function ink(agg: ReturnType<typeof newAgg>, u: Record<string, unknown>): void {
@@ -121,7 +177,11 @@ export function apply(ctx: any): void {
     allDaily: new Map<number, ReturnType<typeof newAgg>>(),
     scanning: false,
     scans: 0,
-    failed: 0,                    // 本轮扫描中无法读取的会话数（部分数据提示）
+    failed: 0,                    // 本轮 RAW 与 harness 均无法读取的会话数
+    rawSessions: 0,               // 通过 RAW 日志（zstd 直接解析）折叠的会话数
+    harnessSessions: 0,           // 通过 harness 解释器兜底折叠的会话数
+    foldedEvents: 0,              // 已折叠的用量事件总数（审计用）
+    dedupSkipped: 0,              // 水位去重跳过的事件数（审计用）
     lastError: null as string | null, // 最近一次会话级失败详情（tooltip 用）
     scanError: null as string | null, // 灾难级错误（会话清单获取失败等）
     lastScanAt: 0,
@@ -155,8 +215,9 @@ export function apply(ctx: any): void {
     if (!Array.isArray(events)) return
     for (const ev of events) {
       if (!usable(ev)) continue
-      if (typeof ev.seq === 'number' && ev.seq <= info.maxSeq) continue
+      if (typeof ev.seq === 'number' && ev.seq <= info.maxSeq) { store.dedupSkipped += 1; continue }
       foldUsage(info, ev.time, ev.data.usage)
+      store.foldedEvents += 1
       if (typeof ev.seq === 'number') info.maxSeq = Math.max(info.maxSeq, ev.seq)
     }
   }
@@ -166,13 +227,23 @@ export function apply(ctx: any): void {
     if (initial) store.scanning = true
     store.scans += 1
     store.lastScanAt = Date.now()
-    // 每轮扫描独立计数失败会话；全部成功则清除历史错误（自愈）
+    // 每轮扫描独立计数；全部成功则清除历史错误（自愈）
     store.failed = 0
+    store.rawSessions = 0
+    store.harnessSessions = 0
     try {
       const query = ctx.get('sessionQuery')
       const persist = ctx.get('sessionPersistence')
 
-      // 1) session list: sessionQuery first; fall back to sessionPersistence.list()
+      // 1) session id 全集 = 磁盘上的原始日志 ∪ harness 会话清单。
+      //    原始日志（RAW）是本插件的首选数据源：直接解压会话自己的
+      //    session.jsonl.zstd（多帧 zstd，zstd CLI），只提取
+      //    assistant/message 的 usage —— 不受 harness 解释器的
+      //    未知事件拒读/口径影响，审计验证 32/32 会话 100% 可读。
+      const logPaths = new Map<string, string>()
+      findSessionLogs(SESSIONS_ROOT, 0, logPaths)
+      const ids = new Set<string>(logPaths.keys())
+
       let records: any[] = []
       if (query) {
         try {
@@ -192,30 +263,49 @@ export function apply(ctx: any): void {
           store.scanError = 'persistence.list: ' + msgOf(e)
         }
       }
-
       const idOf = (rec: any): string | undefined => {
         if (!rec) return undefined
         if (rec.header && typeof rec.header.id === 'string') return rec.header.id
         if (typeof rec.id === 'string') return rec.id
         return undefined
       }
-      const ids: string[] = records.map(idOf).filter((x): x is string => !!x)
+      for (const rec of records) {
+        const id = idOf(rec)
+        if (id) ids.add(id)
+      }
+      const idList: string[] = [...ids]
 
-      // 2) per-session read: sessionQuery.readSession first; fall back to readFrom(id, 0)
+      // 2) per-session: RAW first（完整、不受解释器限制），失败则 harness 兜底
       let i = 0
       async function worker(): Promise<void> {
-        while (i < ids.length) {
-          const id = ids[i]; i += 1
-          let sessionFailed = false
+        while (i < idList.length) {
+          const id = idList[i]; i += 1
           try {
             let events: any[] | null = null
+            // 2a) RAW path: decompress the session's own log
+            const rawPath = logPaths.get(id)
+            if (rawPath) {
+              try {
+                const text = await zstdToText(rawPath)
+                events = parseLogLines(text)
+                if (events && events.length) {
+                  foldSessionEvents(id, events)
+                  store.rawSessions += 1
+                  continue
+                }
+                events = null
+              } catch (e) {
+                store.lastError = 'raw ' + shortOf(id) + ': ' + msgOf(e)
+                events = null
+              }
+            }
+            // 2b) harness fallback: sessionQuery.readSession / persistence.readFrom
             if (query) {
               try {
                 const snap = await query.readSession(id)
                 events = snap && Array.isArray(snap.events) ? snap.events : null
               } catch (e) {
                 store.lastError = 'readSession ' + shortOf(id) + ': ' + msgOf(e)
-                sessionFailed = true
                 events = null
               }
             }
@@ -225,20 +315,23 @@ export function apply(ctx: any): void {
                 events = r && Array.isArray(r.events) ? r.events : []
               } catch (e) {
                 store.lastError = 'readFrom ' + shortOf(id) + ': ' + msgOf(e)
-                sessionFailed = true
                 events = []
               }
             }
-            if (events && events.length) foldSessionEvents(id, events)
+            if (events && events.length) {
+              foldSessionEvents(id, events)
+              store.harnessSessions += 1
+            } else {
+              store.failed += 1
+            }
           } catch (e) {
             store.lastError = 'session ' + shortOf(id) + ': ' + msgOf(e)
-            sessionFailed = true
+            store.failed += 1
           }
-          if (sessionFailed) store.failed += 1
         }
       }
 
-      const n = Math.max(1, Math.min(4, ids.length || 1))
+      const n = Math.max(1, Math.min(4, idList.length || 1))
       const workers: Promise<void>[] = []
       for (let k = 0; k < n; k += 1) workers.push(worker())
       await Promise.all(workers.map((w) => w.catch((e) => { store.lastError = 'worker: ' + msgOf(e); store.failed += 1 })))
@@ -255,8 +348,9 @@ export function apply(ctx: any): void {
     if (!id) return
     if (!usable(event)) return
     const info = ensureSession(id)
-    if (typeof event.seq === 'number' && event.seq <= info.maxSeq) return
+    if (typeof event.seq === 'number' && event.seq <= info.maxSeq) { store.dedupSkipped += 1; return }
     foldUsage(info, event.time, event.data.usage)
+    store.foldedEvents += 1
     if (typeof event.seq === 'number') info.maxSeq = Math.max(info.maxSeq, event.seq)
   })
 
@@ -317,6 +411,10 @@ export function apply(ctx: any): void {
       scanning: store.scanning,
       scans: store.scans,
       failed: store.failed,
+      rawSessions: store.rawSessions,
+      harnessSessions: store.harnessSessions,
+      foldedEvents: store.foldedEvents,
+      dedupSkipped: store.dedupSkipped,
       lastError: store.lastError,
       scanError: store.scanError,
       lastScanAt: store.lastScanAt,
